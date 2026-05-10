@@ -1,306 +1,274 @@
 use std::path::PathBuf;
-use std::process::ExitCode;
 
-use anyhow::Result;
-use clap::{Parser, Subcommand, ValueEnum};
-use hidden_watermark::{
-    BackendChoice, DecodeOptions, DecodeStatus, EncodeOptions, RobustWatermarkOptions,
-    WatermarkPreset, decode_image, encode_image, estimate_capacity,
-};
+use clap::{Parser, Subcommand};
 
-#[derive(Debug, Parser)]
-#[command(version, about = "Robust image watermark encoder and blind decoder")]
+#[derive(Parser)]
+#[command(name = "hidden_watermark")]
+#[command(about = "Robust image watermark encoder and non-blind detector")]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Commands,
 }
 
-#[derive(Debug, Subcommand)]
-enum Command {
-    Encode {
+#[derive(Subcommand)]
+enum Commands {
+    /// Embed watermark into image
+    Embed {
+        /// Input image path
         #[arg(long)]
         input: PathBuf,
+
+        /// Output image path
         #[arg(long)]
         output: PathBuf,
+
+        /// Secret key
         #[arg(long)]
-        id: String,
-        #[command(flatten)]
-        watermark: WatermarkArgs,
-        #[arg(long)]
-        jpeg_quality: Option<u8>,
-        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
-        output_format: OutputFormat,
+        key: String,
+
+        /// Embedding strength (default: 0.5)
+        #[arg(long, default_value = "0.5")]
+        strength: f64,
     },
-    Decode {
+
+    /// Detect watermark by comparing suspect to original
+    Detect {
+        /// Original image path
         #[arg(long)]
-        input: PathBuf,
-        #[command(flatten)]
-        watermark: WatermarkArgs,
-        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
-        diagnostic: OutputFormat,
+        original: PathBuf,
+
+        /// Suspect image path
         #[arg(long)]
-        no_preprocess: bool,
+        suspect: PathBuf,
+
+        /// Secret key
+        #[arg(long)]
+        key: String,
+
+        /// False positive rate (default: 0.001)
+        #[arg(long, default_value = "0.001")]
+        fpr: f64,
     },
-    Capacity {
+
+    /// Batch detection: compare directories of images
+    DetectBatch {
+        /// Directory with original images
         #[arg(long)]
-        input: PathBuf,
-        #[command(flatten)]
-        watermark: WatermarkArgs,
-        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
-        output_format: OutputFormat,
-    },
-    Diagnose {
+        original_dir: PathBuf,
+
+        /// Directory with suspect images
         #[arg(long)]
-        input: PathBuf,
-        #[command(flatten)]
-        watermark: WatermarkArgs,
-        #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
-        output_format: OutputFormat,
+        suspect_dir: PathBuf,
+
+        /// Secret key
+        #[arg(long)]
+        key: String,
+
+        /// False positive rate (default: 0.001)
+        #[arg(long, default_value = "0.001")]
+        fpr: f64,
     },
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum OutputFormat {
-    Text,
-    Json,
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum CliBackend {
-    Auto,
-    FrequencyV2,
-    JpegDct,
-}
-
-impl From<CliBackend> for BackendChoice {
-    fn from(value: CliBackend) -> Self {
-        match value {
-            CliBackend::Auto => Self::Auto,
-            CliBackend::FrequencyV2 => Self::FrequencyV2,
-            CliBackend::JpegDct => Self::JpegDct,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Parser)]
-struct WatermarkArgs {
-    #[arg(long)]
-    key: Option<String>,
-    #[arg(long, default_value_t = 0.25)]
-    strength: f32,
-    #[arg(long, default_value_t = 512)]
-    tile_size: u32,
-    #[arg(long, default_value_t = 0.0)]
-    overlap: f32,
-    #[arg(long, value_enum, default_value_t = CliPreset::Invisible)]
-    preset: CliPreset,
-    #[arg(long, value_enum, default_value_t = CliBackend::Auto)]
-    backend: CliBackend,
-    #[arg(long, default_value_t = 3)]
-    cross_band: usize,
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum CliPreset {
-    Invisible,
-    Balanced,
-    Robust,
-}
-
-impl From<CliPreset> for WatermarkPreset {
-    fn from(value: CliPreset) -> Self {
-        match value {
-            CliPreset::Invisible => Self::Invisible,
-            CliPreset::Balanced => Self::Balanced,
-            CliPreset::Robust => Self::Robust,
-        }
-    }
-}
-
-impl From<WatermarkArgs> for RobustWatermarkOptions {
-    fn from(value: WatermarkArgs) -> Self {
-        Self {
-            key: value.key,
-            strength: value.strength,
-            tile_size: value.tile_size,
-            overlap: value.overlap,
-            preset: value.preset.into(),
-            cross_band_count: value.cross_band,
-        }
-    }
-}
-
-fn main() -> ExitCode {
-    match run() {
-        Ok(code) => code,
-        Err(error) => {
-            eprintln!("error: {error}");
-            ExitCode::from(1)
-        }
-    }
-}
-
-fn run() -> Result<ExitCode> {
+fn main() {
     let cli = Cli::parse();
+
     match cli.command {
-        Command::Encode {
+        Commands::Embed {
             input,
             output,
-            id,
-            watermark,
-            jpeg_quality,
-            output_format,
+            key,
+            strength,
         } => {
-            let backend_choice = watermark.backend.into();
-            let report = encode_image(
-                &input,
-                &output,
-                &id,
-                EncodeOptions {
-                    watermark: watermark.into(),
-                    jpeg_quality,
-                    backend: backend_choice,
-                },
-            )?;
-            match output_format {
-                OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
-                OutputFormat::Text => {
-                    println!(
-                        "encoded id_bytes={} tiles={} image={}x{} tile_size={} strength={}",
-                        report.id_bytes,
-                        report.tile_count,
-                        report.width,
-                        report.height,
-                        report.tile_size,
-                        report.strength
-                    );
-                    println!(
-                        "backend={} algorithm={} psnr={:.2} changed_pixels_ratio={:.4}",
-                        report.backend, report.algorithm, report.psnr, report.changed_pixels_ratio
-                    );
-                }
-            }
-            Ok(ExitCode::SUCCESS)
-        }
-        Command::Decode {
-            input,
-            watermark,
-            diagnostic,
-            no_preprocess,
-        } => {
-            let json = matches!(diagnostic, OutputFormat::Json);
-            let backend_choice = watermark.backend.into();
-
-            let effective_input = if no_preprocess {
-                input.clone()
-            } else {
-                match hidden_watermark::preprocess_with_opencv(&input) {
-                    Ok(path) => path,
-                    Err(e) => {
-                        eprintln!("warning: preprocessing skipped ({e}), decoding raw image");
-                        input.clone()
-                    }
+            let image = match hidden_watermark::load_image(&input) {
+                Ok(img) => img,
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
                 }
             };
 
-            let report = decode_image(
-                &effective_input,
-                DecodeOptions {
-                    watermark: watermark.into(),
-                    enable_diagnostics: json,
-                    backend: backend_choice,
-                },
-            )?;
-            match diagnostic {
-                OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
-                OutputFormat::Text => {
-                    if let Some(id) = &report.id {
-                        println!(
-                            "{id}\nconfidence={:.3} tile_hits={} rotation={} scale={:.2} corrected_bytes={}",
-                            report.confidence,
-                            report.tile_hits,
-                            report.best_rotation_degrees,
-                            report.best_scale,
-                            report.corrected_bytes
-                        );
-                    } else {
-                        println!("no reliable watermark decoded; status={:?}", report.status);
-                    }
-                }
+            println!("Image size: {}x{}", image.width(), image.height());
+
+            let (watermarked, psnr) = hidden_watermark::embed_watermark(&image, &key, strength);
+
+            if let Err(e) = hidden_watermark::save_image(&output, &watermarked) {
+                eprintln!("Error saving: {}", e);
+                std::process::exit(1);
             }
-            Ok(if report.status == DecodeStatus::Decoded {
-                ExitCode::SUCCESS
+
+            println!("Watermark embedded. PSNR: {:.2} dB", psnr);
+            if psnr < 50.0 {
+                println!(
+                    "WARNING: PSNR {:.2} dB < 50 dB. Consider reducing strength.",
+                    psnr
+                );
             } else {
-                ExitCode::from(2)
-            })
-        }
-        Command::Capacity {
-            input,
-            watermark,
-            output_format,
-        } => {
-            let report = estimate_capacity(input, watermark.into())?;
-            match output_format {
-                OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
-                OutputFormat::Text => {
-                    println!(
-                        "max_id_bytes={} recommended_id_bytes={} tiles={} image={}x{} tile_size={}",
-                        report.max_id_bytes,
-                        report.recommended_id_bytes,
-                        report.tile_count,
-                        report.width,
-                        report.height,
-                        report.tile_size
-                    );
-                }
+                println!("PSNR > 50 dB: Watermark is invisible.");
             }
-            Ok(ExitCode::SUCCESS)
         }
-        Command::Diagnose {
-            input,
-            watermark,
-            output_format,
+
+        Commands::Detect {
+            original,
+            suspect,
+            key,
+            fpr,
         } => {
-            let backend_choice = watermark.backend.into();
-            let report = decode_image(
-                &input,
-                DecodeOptions {
-                    watermark: watermark.into(),
-                    enable_diagnostics: true,
-                    backend: backend_choice,
-                },
-            )?;
-            match output_format {
-                OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
-                OutputFormat::Text => {
-                    println!(
-                        "status={:?} id={} confidence={:.3} attempts={} tile_hits={} rotation={} scale={:.2}",
-                        report.status,
-                        report.id.as_deref().unwrap_or("<none>"),
-                        report.confidence,
-                        report.attempts,
-                        report.tile_hits,
-                        report.best_rotation_degrees,
-                        report.best_scale
-                    );
-                    for tile in report.diagnostics.iter().take(20) {
-                        println!(
-                            "tile x={} y={} rot={} scale={:.2} confidence={:.3} status={:?}",
-                            tile.x,
-                            tile.y,
-                            tile.rotation_degrees,
-                            tile.scale,
-                            tile.confidence,
-                            tile.status
-                        );
-                    }
+            let original_img = match hidden_watermark::load_image(&original) {
+                Ok(img) => img,
+                Err(e) => {
+                    eprintln!("Error loading original: {}", e);
+                    std::process::exit(1);
                 }
+            };
+
+            let suspect_img = match hidden_watermark::load_image(&suspect) {
+                Ok(img) => img,
+                Err(e) => {
+                    eprintln!("Error loading suspect: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            println!(
+                "Original: {} ({}x{})",
+                original.display(),
+                original_img.width(),
+                original_img.height()
+            );
+            println!(
+                "Suspect:  {} ({}x{})",
+                suspect.display(),
+                suspect_img.width(),
+                suspect_img.height()
+            );
+            println!();
+
+            let result = hidden_watermark::detect_watermark(&original_img, &suspect_img, &key, fpr);
+
+            println!(
+                "Alignment: rotation={:.1}°, scale={:.3}x, confidence={:.2}",
+                result.alignment.rotation, result.alignment.scale, result.alignment.confidence
+            );
+            println!();
+            println!("Score:     {:.4}", result.score);
+            println!("Threshold: {:.4}", result.threshold);
+            println!();
+
+            if result.alignment.confidence < 0.2 {
+                println!("WARNING: Alignment confidence too low, results are unreliable");
+                println!();
             }
-            Ok(if report.status == DecodeStatus::Decoded {
-                ExitCode::SUCCESS
+
+            if result.detected {
+                println!(
+                    "RESULT: WATERMARK DETECTED (confidence: {:.2}x threshold)",
+                    result.score / result.threshold
+                );
             } else {
-                ExitCode::from(2)
-            })
+                println!("RESULT: No watermark detected");
+            }
+        }
+
+        Commands::DetectBatch {
+            original_dir,
+            suspect_dir,
+            key,
+            fpr,
+        } => {
+            let originals = find_images(&original_dir);
+            let suspects = find_images(&suspect_dir);
+
+            let mut matches = Vec::new();
+            for (name, orig_path) in &originals {
+                if let Some(suspect_path) = suspects.get(name) {
+                    matches.push((name.clone(), orig_path.clone(), suspect_path.clone()));
+                }
+            }
+
+            if matches.is_empty() {
+                println!("No matching images found between directories.");
+                std::process::exit(1);
+            }
+
+            println!("Found {} matching image pairs", matches.len());
+            println!();
+
+            let mut detected_count = 0;
+
+            for (name, orig_path, suspect_path) in &matches {
+                print!("Processing: {} ... ", name);
+
+                let original_img = match hidden_watermark::load_image(orig_path) {
+                    Ok(img) => img,
+                    Err(e) => {
+                        println!("ERROR: {}", e);
+                        continue;
+                    }
+                };
+
+                let suspect_img = match hidden_watermark::load_image(suspect_path) {
+                    Ok(img) => img,
+                    Err(e) => {
+                        println!("ERROR: {}", e);
+                        continue;
+                    }
+                };
+
+                let result =
+                    hidden_watermark::detect_watermark(&original_img, &suspect_img, &key, fpr);
+
+                let align_warn = if result.alignment.confidence < 0.2 {
+                    " [LOW ALIGNMENT CONFIDENCE]"
+                } else {
+                    ""
+                };
+
+                if result.detected {
+                    detected_count += 1;
+                    println!(
+                        "DETECTED (score={:.4}, confidence={:.2}x){}",
+                        result.score,
+                        result.score / result.threshold,
+                        align_warn,
+                    );
+                } else {
+                    println!("NOT_DETECTED (score={:.4}){}", result.score, align_warn,);
+                }
+            }
+
+            println!();
+            println!("============================================================");
+            println!("SUMMARY");
+            println!("============================================================");
+            println!("Total pairs:     {}", matches.len());
+            println!("Detected:        {}", detected_count);
+            println!("Not detected:    {}", matches.len() - detected_count);
+            println!(
+                "Detection rate:  {:.1}%",
+                detected_count as f64 / matches.len() as f64
+            );
         }
     }
+}
+
+fn find_images(dir: &PathBuf) -> std::collections::HashMap<String, PathBuf> {
+    let mut images = std::collections::HashMap::new();
+    let extensions = ["jpg", "jpeg", "png", "bmp", "tiff", "webp"];
+
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Some(ext) = path.extension() {
+                let ext_str = ext.to_string_lossy().to_lowercase();
+                if extensions.contains(&ext_str.as_str())
+                    && let Some(name) = path.file_stem()
+                {
+                    images.insert(name.to_string_lossy().to_string(), path);
+                }
+            }
+        }
+    }
+
+    images
 }

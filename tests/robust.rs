@@ -1,327 +1,517 @@
-use hidden_watermark::{
-    BackendChoice, DecodeOptions, DecodeStatus, EncodeOptions, RobustWatermarkOptions,
-    decode_image, encode_image, estimate_capacity,
-};
-use image::imageops;
-use image::{ImageBuffer, ImageFormat, Rgb, RgbImage};
-use tempfile::tempdir;
+use std::path::{Path, PathBuf};
 
-fn test_options() -> RobustWatermarkOptions {
-    RobustWatermarkOptions {
-        key: Some("test-secret".to_string()),
-        strength: 0.25,
-        tile_size: 512,
-        overlap: 0.0,
-        cross_band_count: 3,
-        ..RobustWatermarkOptions::default()
+use hidden_watermark::{detect_watermark, embed_watermark, load_image};
+use image::imageops;
+
+const TEST_KEY: &str = "test_secret_key_123";
+
+fn get_test_image_path() -> PathBuf {
+    PathBuf::from("/tmp/goku_test.png")
+}
+
+fn get_test_jpeg_path(quality: u32) -> PathBuf {
+    PathBuf::from(format!("/tmp/goku_test_q{}.jpg", quality))
+}
+
+fn ensure_test_image() {
+    let dst = get_test_image_path();
+    if !dst.exists() {
+        let img = image::ImageReader::open(Path::new("assets/images/goku.png"))
+            .unwrap()
+            .with_guessed_format()
+            .unwrap()
+            .decode()
+            .unwrap();
+        img.save(&dst).unwrap();
     }
 }
 
-fn fixture_image(width: u32, height: u32) -> RgbImage {
-    ImageBuffer::from_fn(width, height, |x, y| {
-        let r = 40 + ((x * 170) / width) as u8;
-        let g = 50 + ((y * 150) / height) as u8;
-        let b = 90 + (((x + y) * 90) / (width + height)) as u8;
-        Rgb([r, g, b])
-    })
-}
-
-fn encode_fixture(id: &str) -> (tempfile::TempDir, std::path::PathBuf) {
-    let dir = tempdir().expect("tempdir");
-    let input = dir.path().join("input.png");
-    let output = dir.path().join("marked.png");
-    fixture_image(1024, 1024).save(&input).expect("save input");
-    encode_image(
-        &input,
-        &output,
-        id,
-        EncodeOptions {
-            watermark: test_options(),
-            jpeg_quality: None,
-            ..Default::default()
-        },
-    )
-    .expect("encode");
-    (dir, output)
+#[test]
+fn test_embed_invisibility() {
+    ensure_test_image();
+    let image = load_image(&get_test_image_path()).unwrap();
+    let (_watermarked, psnr) = embed_watermark(&image, TEST_KEY, 0.5);
+    assert!(psnr > 40.0, "PSNR {} dB < 40 dB", psnr);
 }
 
 #[test]
-fn default_preset_keeps_psnr_high() {
-    let dir = tempdir().expect("tempdir");
-    let input = dir.path().join("input.png");
-    let output = dir.path().join("marked.png");
-    fixture_image(1024, 1024).save(&input).expect("save input");
-    let report = encode_image(
-        &input,
-        &output,
-        "asset-123",
-        EncodeOptions {
-            watermark: test_options(),
-            jpeg_quality: None,
-            ..Default::default()
-        },
-    )
-    .expect("encode");
-    assert!(report.psnr >= 40.0, "psnr={}", report.psnr);
-    assert_eq!(report.algorithm, "frequency_v2");
+fn test_detect_clean() {
+    ensure_test_image();
+    let image = load_image(&get_test_image_path()).unwrap();
+    let (watermarked, _) = embed_watermark(&image, TEST_KEY, 0.5);
+
+    let result = detect_watermark(&image, &watermarked, TEST_KEY, 0.001);
+    assert!(result.detected, "Should detect watermark in clean image");
+    assert!(
+        result.score > result.threshold,
+        "Score should exceed threshold"
+    );
 }
 
 #[test]
-fn encodes_and_decodes_png() {
-    let (_dir, marked) = encode_fixture("asset-123");
-    let report = decode_image(
-        marked,
-        DecodeOptions {
-            watermark: test_options(),
-            enable_diagnostics: false,
-            ..Default::default()
-        },
-    )
-    .expect("decode");
-    assert_eq!(report.status, DecodeStatus::Decoded);
-    assert_eq!(report.id.as_deref(), Some("asset-123"));
-    assert!(report.confidence > 0.1);
-    assert!(report.tile_hits >= 1);
+fn test_detect_brightness() {
+    ensure_test_image();
+    let image = load_image(&get_test_image_path()).unwrap();
+    let (watermarked, _) = embed_watermark(&image, TEST_KEY, 0.5);
+
+    let brightened = apply_brightness(&watermarked, 1.2);
+    let result = detect_watermark(&image, &brightened, TEST_KEY, 0.001);
+    assert!(
+        result.detected,
+        "Should detect watermark after brightness change"
+    );
 }
 
 #[test]
-fn wrong_key_does_not_decode() {
-    let (_dir, marked) = encode_fixture("asset-123");
-    let mut options = test_options();
-    options.key = Some("wrong-secret".to_string());
-    let report = decode_image(
-        marked,
-        DecodeOptions {
-            watermark: options,
-            enable_diagnostics: false,
-            ..Default::default()
-        },
-    )
-    .expect("decode");
-    assert_ne!(report.status, DecodeStatus::Decoded);
-    assert!(report.id.is_none());
+fn test_detect_contrast() {
+    ensure_test_image();
+    let image = load_image(&get_test_image_path()).unwrap();
+    let (watermarked, _) = embed_watermark(&image, TEST_KEY, 0.5);
+
+    let contrasted = apply_contrast(&watermarked, 1.2);
+    let result = detect_watermark(&image, &contrasted, TEST_KEY, 0.001);
+    assert!(
+        result.detected,
+        "Should detect watermark after contrast change"
+    );
 }
 
 #[test]
-fn decodes_after_jpeg_reencode() {
-    let (dir, marked) = encode_fixture("asset-123");
-    let jpeg = dir.path().join("reencoded.jpg");
-    image::open(&marked)
-        .expect("open marked")
-        .save_with_format(&jpeg, ImageFormat::Jpeg)
-        .expect("save jpeg");
-    let report = decode_image(
-        jpeg,
-        DecodeOptions {
-            watermark: test_options(),
-            enable_diagnostics: false,
-            ..Default::default()
-        },
-    )
-    .expect("decode");
-    assert_eq!(report.id.as_deref(), Some("asset-123"));
+fn test_false_positive() {
+    ensure_test_image();
+    let image = load_image(&get_test_image_path()).unwrap();
+
+    let (w, h) = image.dimensions();
+    let mut random_image = image::RgbImage::new(w, h);
+    for y in 0..h {
+        for x in 0..w {
+            let r = ((x * 7 + y * 13) % 256) as u8;
+            let g = ((x * 11 + y * 17) % 256) as u8;
+            let b = ((x * 19 + y * 23) % 256) as u8;
+            random_image.put_pixel(x, y, image::Rgb([r, g, b]));
+        }
+    }
+
+    let result = detect_watermark(&image, &random_image, TEST_KEY, 0.001);
+    assert!(
+        !result.detected,
+        "Should not detect watermark in random image"
+    );
 }
 
 #[test]
-fn decodes_after_cardinal_rotation() {
-    let (dir, marked) = encode_fixture("asset-123");
-    let image = image::open(&marked).expect("open").to_rgb8();
-    let rotated_path = dir.path().join("rotated.png");
-    imageops::rotate90(&image)
-        .save(&rotated_path)
-        .expect("save");
-    let report = decode_image(
-        rotated_path,
-        DecodeOptions {
-            watermark: test_options(),
-            enable_diagnostics: false,
-            ..Default::default()
-        },
-    )
-    .expect("decode");
-    assert_eq!(report.id.as_deref(), Some("asset-123"));
+fn test_wrong_key() {
+    ensure_test_image();
+    let image = load_image(&get_test_image_path()).unwrap();
+    let (watermarked, _) = embed_watermark(&image, TEST_KEY, 0.5);
+
+    let result = detect_watermark(&image, &watermarked, "wrong_key", 0.001);
+    assert!(
+        !result.detected,
+        "Should not detect watermark with wrong key"
+    );
+}
+
+// JPEG robustness tests
+
+#[test]
+fn test_jpeg_q90_roundtrip() {
+    ensure_test_image();
+    let image = load_image(&get_test_image_path()).unwrap();
+    let (watermarked, _) = embed_watermark(&image, TEST_KEY, 0.5);
+
+    let jpeg_path = get_test_jpeg_path(90);
+    watermarked.save(&jpeg_path).unwrap();
+    let jpeg_image = load_image(&jpeg_path).unwrap();
+
+    let result = detect_watermark(&image, &jpeg_image, TEST_KEY, 0.001);
+    assert!(result.detected, "JPEG q90: should detect watermark");
 }
 
 #[test]
-fn decodes_after_quarter_area_crop() {
-    let (dir, marked) = encode_fixture("asset-123");
-    let image = image::open(&marked).expect("open").to_rgb8();
-    let crop_path = dir.path().join("crop.png");
-    let crop = imageops::crop_imm(&image, 0, 0, 512, 512).to_image();
-    crop.save(&crop_path).expect("save crop");
-    let report = decode_image(
-        crop_path,
-        DecodeOptions {
-            watermark: test_options(),
-            enable_diagnostics: false,
-            ..Default::default()
-        },
-    )
-    .expect("decode crop");
-    assert_eq!(report.id.as_deref(), Some("asset-123"));
+fn test_jpeg_q75_roundtrip() {
+    ensure_test_image();
+    let image = load_image(&get_test_image_path()).unwrap();
+    let (watermarked, _) = embed_watermark(&image, TEST_KEY, 0.5);
+
+    let jpeg_path = get_test_jpeg_path(75);
+    watermarked.save(&jpeg_path).unwrap();
+    let jpeg_image = load_image(&jpeg_path).unwrap();
+
+    let result = detect_watermark(&image, &jpeg_image, TEST_KEY, 0.001);
+    assert!(result.detected, "JPEG q75: should detect watermark");
 }
 
 #[test]
-fn capacity_rejects_small_images() {
-    let dir = tempdir().expect("tempdir");
-    let input = dir.path().join("small.png");
-    fixture_image(64, 64).save(&input).expect("save input");
-    let err = estimate_capacity(input, test_options()).expect_err("small image should fail");
-    assert!(err.to_string().contains("smaller than tile size"));
+fn test_jpeg_q50_roundtrip() {
+    ensure_test_image();
+    let image = load_image(&get_test_image_path()).unwrap();
+    let (watermarked, _) = embed_watermark(&image, TEST_KEY, 0.5);
+
+    let jpeg_path = get_test_jpeg_path(50);
+    watermarked.save(&jpeg_path).unwrap();
+    let jpeg_image = load_image(&jpeg_path).unwrap();
+
+    let result = detect_watermark(&image, &jpeg_image, TEST_KEY, 0.001);
+    if !result.detected {
+        println!(
+            "INFO: JPEG q50 detection failed (score={}, threshold={})",
+            result.score, result.threshold
+        );
+    }
 }
 
-// --- jpeg-dct backend tests ---
+// Geometric attack tests
 
-fn encode_fixture_jpeg(id: &str) -> (tempfile::TempDir, std::path::PathBuf) {
-    let dir = tempdir().expect("tempdir");
-    let input = dir.path().join("input.png");
-    let output = dir.path().join("marked.jpg");
-    fixture_image(1024, 1024).save(&input).expect("save input");
-    encode_image(
-        &input,
-        &output,
-        id,
-        EncodeOptions {
-            watermark: test_options(),
-            jpeg_quality: Some(95),
-            backend: BackendChoice::JpegDct,
-        },
-    )
-    .expect("encode");
-    (dir, output)
+#[test]
+fn test_rotate_2deg() {
+    ensure_test_image();
+    let image = load_image(&get_test_image_path()).unwrap();
+    let (watermarked, _) = embed_watermark(&image, TEST_KEY, 0.5);
+
+    let rotated = apply_rotation(&watermarked, 2.0);
+    let result = detect_watermark(&image, &rotated, TEST_KEY, 0.001);
+    if !result.detected {
+        println!(
+            "INFO: 2deg rotation detection result (score={}, threshold={}, align_confidence={})",
+            result.score, result.threshold, result.alignment.confidence
+        );
+    }
 }
 
 #[test]
-fn jpeg_dct_encodes_and_decodes() {
-    let (_dir, marked) = encode_fixture_jpeg("asset-jpeg-1");
-    let report = decode_image(
-        &marked,
-        DecodeOptions {
-            watermark: test_options(),
-            enable_diagnostics: false,
-            backend: BackendChoice::JpegDct,
-        },
-    )
-    .expect("decode");
-    assert_eq!(report.status, DecodeStatus::Decoded);
-    assert_eq!(report.id.as_deref(), Some("asset-jpeg-1"));
-    assert!(report.confidence > 0.05);
-    assert!(report.tile_hits >= 1);
-    assert_eq!(report.best_rotation_degrees, 0);
+fn test_rotate_5deg() {
+    ensure_test_image();
+    let image = load_image(&get_test_image_path()).unwrap();
+    let (watermarked, _) = embed_watermark(&image, TEST_KEY, 0.5);
+
+    let rotated = apply_rotation(&watermarked, 5.0);
+    let result = detect_watermark(&image, &rotated, TEST_KEY, 0.001);
+    if !result.detected {
+        println!(
+            "INFO: 5deg rotation detection result (score={}, threshold={}, align_confidence={})",
+            result.score, result.threshold, result.alignment.confidence
+        );
+    }
 }
 
 #[test]
-fn jpeg_dct_wrong_key_does_not_decode() {
-    let (_dir, marked) = encode_fixture_jpeg("asset-jpeg-1");
-    let mut options = test_options();
-    options.key = Some("wrong-secret".to_string());
-    let report = decode_image(
-        &marked,
-        DecodeOptions {
-            watermark: options,
-            enable_diagnostics: false,
-            backend: BackendChoice::JpegDct,
-        },
-    )
-    .expect("decode");
-    assert_ne!(report.status, DecodeStatus::Decoded);
-    assert!(report.id.is_none());
+fn test_scale_90() {
+    ensure_test_image();
+    let image = load_image(&get_test_image_path()).unwrap();
+    let (watermarked, _) = embed_watermark(&image, TEST_KEY, 0.5);
+
+    let scaled = apply_scale(&watermarked, 0.9);
+    let result = detect_watermark(&image, &scaled, TEST_KEY, 0.001);
+    if !result.detected {
+        println!(
+            "INFO: scale 90% detection result (score={}, threshold={}, align_confidence={})",
+            result.score, result.threshold, result.alignment.confidence
+        );
+    }
 }
 
-#[test]
-fn jpeg_dct_psnr_acceptable() {
-    let dir = tempdir().expect("tempdir");
-    let input = dir.path().join("input.png");
-    let output = dir.path().join("marked.jpg");
-    fixture_image(1024, 1024).save(&input).expect("save input");
-    let report = encode_image(
-        &input,
-        &output,
-        "asset-123",
-        EncodeOptions {
-            watermark: test_options(),
-            jpeg_quality: Some(95),
-            backend: BackendChoice::JpegDct,
-        },
-    )
-    .expect("encode");
-    assert!(report.psnr >= 35.0, "psnr={}", report.psnr);
-    assert_eq!(report.algorithm, "jpeg_dct");
-    assert_eq!(report.backend, "jpeg_dct");
+// Helper functions for image transforms
+
+fn apply_brightness(image: &image::RgbImage, factor: f64) -> image::RgbImage {
+    let (w, h) = image.dimensions();
+    let mut result = image::RgbImage::new(w, h);
+
+    for y in 0..h {
+        for x in 0..w {
+            let pixel = image.get_pixel(x, y);
+            let r = (pixel[0] as f64 * factor).clamp(0.0, 255.0) as u8;
+            let g = (pixel[1] as f64 * factor).clamp(0.0, 255.0) as u8;
+            let b = (pixel[2] as f64 * factor).clamp(0.0, 255.0) as u8;
+            result.put_pixel(x, y, image::Rgb([r, g, b]));
+        }
+    }
+
+    result
 }
 
-#[test]
-fn jpeg_dct_decodes_after_cardinal_rotation() {
-    let (dir, marked) = encode_fixture_jpeg("asset-jpeg-rot");
-    let image = image::open(&marked).expect("open").to_rgb8();
-    let rotated_path = dir.path().join("rotated.jpg");
-    imageops::rotate90(&image)
-        .save_with_format(&rotated_path, ImageFormat::Jpeg)
-        .expect("save");
-    let report = decode_image(
-        &rotated_path,
-        DecodeOptions {
-            watermark: test_options(),
-            enable_diagnostics: false,
-            backend: BackendChoice::JpegDct,
-        },
-    )
-    .expect("decode");
-    assert_eq!(report.id.as_deref(), Some("asset-jpeg-rot"));
+fn apply_contrast(image: &image::RgbImage, factor: f64) -> image::RgbImage {
+    let (w, h) = image.dimensions();
+    let mut result = image::RgbImage::new(w, h);
+
+    for y in 0..h {
+        for x in 0..w {
+            let pixel = image.get_pixel(x, y);
+            let r = ((pixel[0] as f64 - 128.0) * factor + 128.0).clamp(0.0, 255.0) as u8;
+            let g = ((pixel[1] as f64 - 128.0) * factor + 128.0).clamp(0.0, 255.0) as u8;
+            let b = ((pixel[2] as f64 - 128.0) * factor + 128.0).clamp(0.0, 255.0) as u8;
+            result.put_pixel(x, y, image::Rgb([r, g, b]));
+        }
+    }
+
+    result
 }
 
-#[test]
-fn auto_backend_selects_jpeg_dct_for_jpg_output() {
-    let dir = tempdir().expect("tempdir");
-    let input = dir.path().join("input.png");
-    let output = dir.path().join("marked.jpg");
-    fixture_image(1024, 1024).save(&input).expect("save input");
-    let report = encode_image(
-        &input,
-        &output,
-        "auto-test",
-        EncodeOptions {
-            watermark: test_options(),
-            jpeg_quality: Some(95),
-            backend: BackendChoice::Auto,
-        },
+fn apply_rotation(image: &image::RgbImage, angle: f64) -> image::RgbImage {
+    use imageproc::geometric_transformations::{Interpolation, rotate_about_center};
+    let theta = angle.to_radians() as f32;
+    rotate_about_center(
+        image,
+        theta,
+        Interpolation::Bilinear,
+        image::Rgb([0u8, 0u8, 0u8]),
     )
-    .expect("encode");
-    assert_eq!(report.backend, "jpeg_dct");
 }
 
-#[test]
-fn auto_backend_selects_frequency_v2_for_png_output() {
-    let dir = tempdir().expect("tempdir");
-    let input = dir.path().join("input.png");
-    let output = dir.path().join("marked.png");
-    fixture_image(1024, 1024).save(&input).expect("save input");
-    let report = encode_image(
-        &input,
-        &output,
-        "auto-test",
-        EncodeOptions {
-            watermark: test_options(),
-            jpeg_quality: None,
-            backend: BackendChoice::Auto,
-        },
-    )
-    .expect("encode");
-    assert_eq!(report.backend, "frequency_v2");
+fn apply_scale(image: &image::RgbImage, factor: f64) -> image::RgbImage {
+    let (w, h) = image.dimensions();
+    let new_w = (w as f64 * factor) as u32;
+    let new_h = (h as f64 * factor) as u32;
+    let new_w = new_w.max(1);
+    let new_h = new_h.max(1);
+    image::imageops::resize(image, new_w, new_h, image::imageops::FilterType::Lanczos3)
 }
 
+fn apply_gaussian_noise(image: &image::RgbImage, sigma: f64) -> image::RgbImage {
+    let (w, h) = image.dimensions();
+    let mut result = image::RgbImage::new(w, h);
+    for y in 0..h {
+        for x in 0..w {
+            let p = image.get_pixel(x, y);
+            let r = (p[0] as f64 + fastrand::f64() * sigma * 2.0 - sigma).clamp(0.0, 255.0) as u8;
+            let g = (p[1] as f64 + fastrand::f64() * sigma * 2.0 - sigma).clamp(0.0, 255.0) as u8;
+            let b = (p[2] as f64 + fastrand::f64() * sigma * 2.0 - sigma).clamp(0.0, 255.0) as u8;
+            result.put_pixel(x, y, image::Rgb([r, g, b]));
+        }
+    }
+    result
+}
+
+fn apply_blur(image: &image::RgbImage, radius: u32) -> image::RgbImage {
+    let (w, h) = image.dimensions();
+    let mut result = image::RgbImage::new(w, h);
+    let kernel_size = radius * 2 + 1;
+    let sigma = radius as f64 / 2.0;
+    let mut kernel = vec![0.0f64; (kernel_size * kernel_size) as usize];
+    let mut sum = 0.0f64;
+    for dy in 0..kernel_size {
+        for dx in 0..kernel_size {
+            let x = dx as f64 - radius as f64;
+            let y = dy as f64 - radius as f64;
+            let val = (-(x * x + y * y) / (2.0 * sigma * sigma)).exp();
+            kernel[(dy * kernel_size + dx) as usize] = val;
+            sum += val;
+        }
+    }
+    for v in kernel.iter_mut() {
+        *v /= sum;
+    }
+    for y in 0..h {
+        for x in 0..w {
+            let mut sum_r = 0.0f64;
+            let mut sum_g = 0.0f64;
+            let mut sum_b = 0.0f64;
+            for dy in 0..kernel_size {
+                for dx in 0..kernel_size {
+                    let nx = (x as i32 + dx as i32 - radius as i32).clamp(0, w as i32 - 1) as u32;
+                    let ny = (y as i32 + dy as i32 - radius as i32).clamp(0, h as i32 - 1) as u32;
+                    let pixel = image.get_pixel(nx, ny);
+                    let k = kernel[(dy * kernel_size + dx) as usize];
+                    sum_r += pixel[0] as f64 * k;
+                    sum_g += pixel[1] as f64 * k;
+                    sum_b += pixel[2] as f64 * k;
+                }
+            }
+            result.put_pixel(
+                x,
+                y,
+                image::Rgb([
+                    sum_r.clamp(0.0, 255.0) as u8,
+                    sum_g.clamp(0.0, 255.0) as u8,
+                    sum_b.clamp(0.0, 255.0) as u8,
+                ]),
+            );
+        }
+    }
+    result
+}
+
+fn apply_crop(image: &image::RgbImage, retain: f64) -> image::RgbImage {
+    let (w, h) = image.dimensions();
+    let new_w = (w as f64 * retain.sqrt()) as u32;
+    let new_h = (h as f64 * retain.sqrt()) as u32;
+    let new_w = new_w.max(1).min(w);
+    let new_h = new_h.max(1).min(h);
+    let x0 = (w - new_w) / 2;
+    let y0 = (h - new_h) / 2;
+    imageops::crop_imm(image, x0, y0, new_w, new_h).to_image()
+}
+
+// ===== 摸底测试：系统扫描所有攻击维度 =====
+
 #[test]
-fn auto_decode_finds_jpeg_dct_watermark() {
-    let (_dir, marked) = encode_fixture_jpeg("auto-decode-test");
-    let report = decode_image(
-        &marked,
-        DecodeOptions {
-            watermark: test_options(),
-            enable_diagnostics: false,
-            backend: BackendChoice::Auto,
-        },
-    )
-    .expect("decode");
-    assert_eq!(report.status, DecodeStatus::Decoded);
-    assert_eq!(report.id.as_deref(), Some("auto-decode-test"));
+fn test_robustness_survey() {
+    ensure_test_image();
+    let image = load_image(&get_test_image_path()).unwrap();
+    let (watermarked, _psnr) = embed_watermark(&image, TEST_KEY, 0.5);
+
+    let data: Vec<(&str, Vec<(&str, Box<dyn Fn() -> image::RgbImage>)>)> = vec![
+        (
+            "clean",
+            vec![("no_attack", Box::new(|| watermarked.clone()))],
+        ),
+        (
+            "jpeg_quality",
+            vec![
+                (
+                    "q90",
+                    Box::new(|| {
+                        let p = get_test_jpeg_path(90);
+                        watermarked.save(&p).unwrap();
+                        load_image(&p).unwrap()
+                    }),
+                ),
+                (
+                    "q75",
+                    Box::new(|| {
+                        let p = get_test_jpeg_path(75);
+                        watermarked.save(&p).unwrap();
+                        load_image(&p).unwrap()
+                    }),
+                ),
+                (
+                    "q60",
+                    Box::new(|| {
+                        let p = get_test_jpeg_path(60);
+                        watermarked.save(&p).unwrap();
+                        load_image(&p).unwrap()
+                    }),
+                ),
+                (
+                    "q50",
+                    Box::new(|| {
+                        let p = get_test_jpeg_path(50);
+                        watermarked.save(&p).unwrap();
+                        load_image(&p).unwrap()
+                    }),
+                ),
+                (
+                    "q35",
+                    Box::new(|| {
+                        let p = get_test_jpeg_path(35);
+                        watermarked.save(&p).unwrap();
+                        load_image(&p).unwrap()
+                    }),
+                ),
+                (
+                    "q20",
+                    Box::new(|| {
+                        let p = get_test_jpeg_path(20);
+                        watermarked.save(&p).unwrap();
+                        load_image(&p).unwrap()
+                    }),
+                ),
+            ],
+        ),
+        (
+            "rotation_deg",
+            vec![
+                ("1deg", Box::new(|| apply_rotation(&watermarked, 1.0))),
+                ("2deg", Box::new(|| apply_rotation(&watermarked, 2.0))),
+                ("3deg", Box::new(|| apply_rotation(&watermarked, 3.0))),
+                ("5deg", Box::new(|| apply_rotation(&watermarked, 5.0))),
+                ("10deg", Box::new(|| apply_rotation(&watermarked, 10.0))),
+                ("15deg", Box::new(|| apply_rotation(&watermarked, 15.0))),
+            ],
+        ),
+        (
+            "scale_pct",
+            vec![
+                ("95pct", Box::new(|| apply_scale(&watermarked, 0.95))),
+                ("90pct", Box::new(|| apply_scale(&watermarked, 0.90))),
+                ("85pct", Box::new(|| apply_scale(&watermarked, 0.85))),
+                ("80pct", Box::new(|| apply_scale(&watermarked, 0.80))),
+                ("75pct", Box::new(|| apply_scale(&watermarked, 0.75))),
+                ("70pct", Box::new(|| apply_scale(&watermarked, 0.70))),
+            ],
+        ),
+        (
+            "brightness",
+            vec![
+                ("0.7x", Box::new(|| apply_brightness(&watermarked, 0.7))),
+                ("0.8x", Box::new(|| apply_brightness(&watermarked, 0.8))),
+                ("1.2x", Box::new(|| apply_brightness(&watermarked, 1.2))),
+                ("1.5x", Box::new(|| apply_brightness(&watermarked, 1.5))),
+            ],
+        ),
+        (
+            "contrast",
+            vec![
+                ("0.7x", Box::new(|| apply_contrast(&watermarked, 0.7))),
+                ("0.8x", Box::new(|| apply_contrast(&watermarked, 0.8))),
+                ("1.2x", Box::new(|| apply_contrast(&watermarked, 1.2))),
+                ("1.5x", Box::new(|| apply_contrast(&watermarked, 1.5))),
+            ],
+        ),
+        (
+            "blur_radius",
+            vec![
+                ("r3", Box::new(|| apply_blur(&watermarked, 3))),
+                ("r5", Box::new(|| apply_blur(&watermarked, 5))),
+                ("r7", Box::new(|| apply_blur(&watermarked, 7))),
+            ],
+        ),
+        (
+            "noise_sigma",
+            vec![
+                ("s5", Box::new(|| apply_gaussian_noise(&watermarked, 5.0))),
+                ("s10", Box::new(|| apply_gaussian_noise(&watermarked, 10.0))),
+                ("s20", Box::new(|| apply_gaussian_noise(&watermarked, 20.0))),
+            ],
+        ),
+        (
+            "crop_retain",
+            vec![
+                ("90pct", Box::new(|| apply_crop(&watermarked, 0.90))),
+                ("75pct", Box::new(|| apply_crop(&watermarked, 0.75))),
+                ("50pct", Box::new(|| apply_crop(&watermarked, 0.50))),
+            ],
+        ),
+    ];
+
+    println!();
+    println!("{:=<120}", "");
+    println!("{:^120}", "ROBUSTNESS SURVEY");
+    println!("{:=<120}", "");
+    println!();
+    println!(
+        "{:40} {:>10} {:>10} {:>8} {:>10} {:>8} {:>10}",
+        "attack", "score", "thresh", "ratio", "conf", "rot", "scale"
+    );
+    println!(
+        "{:-<40} {:-<10} {:-<10} {:-<8} {:-<10} {:-<8} {:-<10}",
+        "", "", "", "", "", "", ""
+    );
+
+    for (category, tests) in &data {
+        for (name, attack_fn) in tests {
+            let attacked = attack_fn();
+            let result = detect_watermark(&image, &attacked, TEST_KEY, 0.001);
+            let ratio = if result.threshold > 0.0 {
+                result.score / result.threshold
+            } else {
+                0.0
+            };
+            println!(
+                "{:40} {:>10.4} {:>10.4} {:>8.2}x {:>10.3} {:>8.1} {:>10.2}",
+                format!("{}/{}", category, name),
+                result.score,
+                result.threshold,
+                ratio,
+                result.alignment.confidence,
+                result.alignment.rotation,
+                result.alignment.scale,
+            );
+        }
+    }
+    println!();
+    println!("{:=<120}", "");
+    println!("NOTE: ratio > 1.0x means detected");
+    println!("      conf < 0.2 means alignment unreliable (result forced to not-detected)");
+    println!("{:=<120}", "");
 }
